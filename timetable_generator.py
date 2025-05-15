@@ -1,5 +1,7 @@
 import os
 import json
+import re
+from datetime import datetime
 import pandas as pd
 from datetime import datetime, timedelta
 import csv
@@ -12,6 +14,225 @@ from tkinter import filedialog
 from groq import Groq  # For Groq API
 # Using updated import to fix deprecation warning
 from langchain_ollama import OllamaLLM  # For Ollama local models
+
+
+class CsvSaver:
+    """
+    Class responsible for saving CSV content to files with various options.
+    This class handles all the CSV saving functionality for the timetable generator.
+    """
+    
+    def __init__(self, default_folder="timetables"):
+        """Initialize the CSV Saver with default save location"""
+        self.default_folder = default_folder
+        
+    def get_save_location(self):
+        """Get the user's preferred location to save the CSV file"""
+        print("\n===== SAVE LOCATION =====")
+        print(f"Default save location: {os.path.abspath(self.default_folder)}")
+        
+        # Ask user if they want to use default location or choose a different one
+        choice = input("Save to default location? (y/n): ").lower()
+        
+        if choice == 'y' or choice == '':
+            # Use default location, ensure it exists
+            if not os.path.exists(self.default_folder):
+                try:
+                    os.makedirs(self.default_folder)
+                    print(f"Created folder: {os.path.abspath(self.default_folder)}")
+                except Exception as e:
+                    print(f"Warning: Could not create default folder: {e}")
+                    print("Will attempt to save in current directory instead.")
+                    return ""
+            return self.default_folder
+        else:
+            # Use file dialog to choose location
+            try:
+                # Initialize tkinter and hide the main window
+                root = tk.Tk()
+                root.withdraw()
+                
+                # Show directory selection dialog
+                print("Please select a folder to save the timetable...")
+                save_dir = filedialog.askdirectory(title="Select folder to save timetable")
+                
+                # Clean up tkinter
+                root.destroy()
+                
+                if save_dir:
+                    print(f"Selected save location: {save_dir}")
+                    return save_dir
+                else:
+                    print("No folder selected. Using default location.")
+                    return self.default_folder
+            except Exception as e:
+                print(f"Error using folder dialog: {e}")
+                
+                # Fallback to manual input if dialog fails
+                custom_path = input("Enter full path to save folder: ")
+                if custom_path and os.path.exists(custom_path):
+                    return custom_path
+                else:
+                    if custom_path:
+                        try:
+                            os.makedirs(custom_path)
+                            print(f"Created folder: {custom_path}")
+                            return custom_path
+                        except Exception as e:
+                            print(f"Could not create folder: {e}")
+                    
+                    print("Using default location.")
+                    return self.default_folder
+    
+    def generate_filename(self, institute_name, batch_info, start_date=None, end_date=None):
+        """Generate a filename based on institute, batch, and date range"""
+        # Clean institute name
+        institute_name = institute_name.replace(" ", "_") if institute_name else "Institute"
+        
+        # Format batch information if available
+        batch_suffix = ""
+        if batch_info:
+            if isinstance(batch_info, list) and batch_info:
+                batch = batch_info[0]
+            else:
+                batch = batch_info
+            batch_suffix = f"_{str(batch).replace(' ', '_')}"
+        
+        # Create filename with date range or timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        if start_date and end_date:
+            # Convert dates to clean format for filename - replace any punctuation
+            start_clean = str(start_date).replace("/", "-").replace(" ", "_").replace(",", "")
+            end_clean = str(end_date).replace("/", "-").replace(" ", "_").replace(",", "")
+            filename = f"{institute_name}{batch_suffix}_timetable_{start_clean}_to_{end_clean}.csv"
+        else:
+            # Fallback to timestamp
+            filename = f"{institute_name}{batch_suffix}_timetable_{timestamp}.csv"
+            
+        return filename
+    
+    def save_csv(self, csv_content, institute_name="Institute", batch_info=None, 
+                 start_date=None, end_date=None, custom_filename=None, save_location=None):
+        """
+        Save CSV content to a file.
+        
+        Args:
+            csv_content (str): The CSV content to save
+            institute_name (str): Name of the institute for filename generation
+            batch_info (str or list): Batch information for filename generation
+            start_date (str): Start date for filename generation
+            end_date (str): End date for filename generation
+            custom_filename (str): Optional custom filename to use instead of generated one
+            save_location (str): Optional specific save location to use
+            
+        Returns:
+            tuple: (success (bool), filepath (str), error_message (str or None))
+        """
+        # Always use the default folder without prompting
+        output_folder = save_location if save_location else self.default_folder
+        
+        # Ensure the default folder exists
+        if not os.path.exists(output_folder):
+            try:
+                os.makedirs(output_folder)
+                print(f"Created folder: {os.path.abspath(output_folder)}")
+            except Exception as e:
+                print(f"Warning: Could not create default folder: {e}")
+                print("Will save in current directory instead.")
+                output_folder = ""
+        
+        # Generate or use custom filename
+        if custom_filename:
+            # Ensure filename ends with .csv
+            if not custom_filename.lower().endswith('.csv'):
+                filename = f"{custom_filename}.csv"
+            else:
+                filename = custom_filename
+        else:
+            filename = self.generate_filename(institute_name, batch_info, start_date, end_date)
+        
+        # Full path to save file
+        filepath = os.path.join(output_folder, filename)
+        
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            
+            # Save the file
+            with open(filepath, "w", newline='', encoding='utf-8') as f:
+                f.write(csv_content)
+            
+            # Get full absolute path to display to user
+            full_path = os.path.abspath(filepath)
+            
+            print(f"\n✅ CSV file successfully saved!")
+            print(f"📄 File: {filename}")
+            print(f"📁 Location: {full_path}")
+            
+            # Create backup copy
+            self._create_backup(filepath, filename)
+            
+            # Preview the saved content
+            self._show_preview(csv_content)
+            
+            # Offer to open the folder
+            self._offer_open_folder(full_path)
+            
+            return True, full_path, None
+            
+        except Exception as e:
+            error_message = f"Error saving file: {e}"
+            print(f"\n❌ {error_message}")
+            
+            # Try saving to current directory as fallback
+            try:
+                fallback_path = os.path.join(os.getcwd(), filename)
+                with open(fallback_path, "w", newline='', encoding='utf-8') as f:
+                    f.write(csv_content)
+                print(f"Saved to current directory instead: {fallback_path}")
+                return True, fallback_path, error_message
+            except Exception as e2:
+                final_error = f"Failed to save file to fallback location: {e2}"
+                print(final_error)
+                return False, None, f"{error_message}. {final_error}"
+    
+    def _create_backup(self, filepath, filename):
+        """Create a backup copy of the saved file"""
+        try:
+            backup_folder = os.path.join(os.path.dirname(filepath), "backups")
+            if not os.path.exists(backup_folder):
+                os.makedirs(backup_folder)
+            backup_path = os.path.join(backup_folder, f"backup_{filename}")
+            shutil.copy2(filepath, backup_path)
+            print(f"💾 Backup copy saved to: {backup_path}")
+        except Exception as e:
+            # Non-critical error, just log it
+            print(f"Note: Could not create backup: {e}")
+    
+    def _show_preview(self, csv_content, max_lines=10):
+        """Show a preview of the CSV content"""
+        print("\n===== SAMPLE OF SAVED CSV =====")
+        preview_lines = csv_content.split('\n')[:max_lines]
+        for line in preview_lines:
+            print(line)
+    
+    def _offer_open_folder(self, filepath):
+        """Offer to open the folder containing the saved file"""
+        if input("\nWould you like to open the folder containing the file? (y/n): ").lower() == 'y':
+            try:
+                folder_path = os.path.dirname(filepath)
+                if os.name == 'nt':  # Windows
+                    os.startfile(folder_path)
+                else:  # macOS or Linux
+                    import subprocess
+                    if os.name == 'posix':
+                        if 'darwin' in os.sys.platform:  # macOS
+                            subprocess.call(['open', folder_path])
+                        else:  # Linux
+                            subprocess.call(['xdg-open', folder_path])
+                print(f"Opened folder: {folder_path}")
+            except Exception as e:
+                print(f"Could not open folder: {e}")
 
 
 class TimeTableGenerator:
@@ -28,6 +249,7 @@ class TimeTableGenerator:
             "batch_names": [],
             "constraints": {}
         }
+        self.csv_saver = CsvSaver()  # Initialize the CSV Saver
 
     def setup_llm(self):
         """Let user select which LLM provider to use"""
@@ -83,7 +305,7 @@ class TimeTableGenerator:
             # Use Groq API with specified model
             chat_completion = self.llm.chat.completions.create(
                 messages=self.conversation_history,
-                model="deepseek-r1-distill-llama-70b",  # Use the specified model
+                model="compound-beta",  # Use the specified model
                 temperature=0.1,
                 max_tokens=4096
             )
@@ -184,6 +406,111 @@ class TimeTableGenerator:
             return True
         except Exception as e:
             print(f"Error initializing with reference: {e}")
+            return False
+            
+    def validate_date_range(self, csv_content, expected_start_date, expected_end_date):
+        """Validate that the CSV covers the entire date range from start to end date"""
+        try:
+            # Split the CSV content into lines
+            lines = csv_content.strip().split('\n')
+            
+            # Skip header rows (assumed to be 3 rows based on templates)
+            data_lines = lines[3:]
+            
+            # Pattern for date extraction (e.g., "24-Mar" or "15-May")
+            date_pattern = re.compile(r'^(\d{1,2}-\w{3})')
+            
+            # Extract dates from the first column of each row where a date appears
+            timetable_dates = []
+            for line in data_lines:
+                if not line.strip():
+                    continue
+    
+                parts = line.split(',')
+                if not parts:
+                    continue
+    
+                first_cell = parts[0].strip()
+                match = date_pattern.search(first_cell)
+                if match:
+                    timetable_dates.append(match.group(1))
+            
+            if not timetable_dates:
+                print("No dates found in the timetable.")
+                return False
+    
+            print(f"Found dates in timetable: {timetable_dates[0]} to {timetable_dates[-1]}")
+            
+            # Try different date formats since input dates could be in various formats
+            # Expected format in CSV is typically DD-MMM (e.g., 24-Mar)
+            possible_formats = [
+                "%d-%b", "%d-%B", "%d %b", "%d %B",  # 24-Mar, 24-March, 24 Mar, 24 March
+                "%b-%d", "%B-%d", "%b %d", "%B %d",  # Mar-24, March-24, Mar 24, March 24
+                "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d",  # Various numeric formats
+                "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d",
+                "%d.%m.%Y", "%m.%d.%Y", "%Y.%m.%d"
+            ]
+            
+            # Convert input dates to the same format as timetable dates
+            formatted_start = None
+            formatted_end = None
+            
+            # First try to parse the timetable dates to determine their format
+            timetable_format = None
+            for fmt in ["%d-%b", "%d-%B"]:
+                try:
+                    datetime.strptime(timetable_dates[0], fmt)
+                    timetable_format = fmt
+                    break
+                except ValueError:
+                    continue
+            
+            if not timetable_format:
+                print("Could not determine timetable date format.")
+                return False
+            
+            # Then try to convert the input dates to the timetable format
+            for fmt in possible_formats:
+                try:
+                    start_dt = datetime.strptime(expected_start_date, fmt)
+                    formatted_start = start_dt.strftime(timetable_format)
+                    
+                    end_dt = datetime.strptime(expected_end_date, fmt)
+                    formatted_end = end_dt.strftime(timetable_format)
+                    
+                    break
+                except ValueError:
+                    continue
+            
+            if not formatted_start or not formatted_end:
+                # If standard formats fail, try a more flexible approach with dateutil
+                try:
+                    from dateutil import parser
+                    
+                    start_dt = parser.parse(expected_start_date)
+                    formatted_start = start_dt.strftime(timetable_format)
+                    
+                    end_dt = parser.parse(expected_end_date)
+                    formatted_end = end_dt.strftime(timetable_format)
+                except:
+                    print(f"Could not parse input dates: {expected_start_date}, {expected_end_date}")
+                    return False
+            
+            print(f"Expected date range: {formatted_start} to {formatted_end}")
+            
+            # Check if the first and last dates match the expected range
+            if timetable_dates[0] != formatted_start:
+                print(f"Timetable does not start on the expected date. Expected: {formatted_start}, Found: {timetable_dates[0]}")
+                return False
+    
+            if timetable_dates[-1] != formatted_end:
+                print(f"Timetable does not end on the expected date. Expected: {formatted_end}, Found: {timetable_dates[-1]}")
+                return False
+    
+            return True
+            
+        except Exception as e:
+            print(f"Date range validation error: {str(e)}")
             return False
 
     def extract_csv_from_response(self, response):
@@ -389,63 +716,6 @@ class TimeTableGenerator:
         
         return True
         
-    def get_save_location(self, default_folder="timetables"):
-        """Get the user's preferred location to save the timetable CSV"""
-        print("\n===== SAVE LOCATION =====")
-        print(f"Default save location: {os.path.abspath(default_folder)}")
-        
-        # Ask user if they want to use default location or choose a different one
-        choice = input("Save to default location? (y/n): ").lower()
-        
-        if choice == 'y' or choice == '':
-            # Use default location, ensure it exists
-            if not os.path.exists(default_folder):
-                try:
-                    os.makedirs(default_folder)
-                    print(f"Created folder: {os.path.abspath(default_folder)}")
-                except Exception as e:
-                    print(f"Warning: Could not create default folder: {e}")
-                    print("Will attempt to save in current directory instead.")
-                    return ""
-            return default_folder
-        else:
-            # Use file dialog to choose location
-            try:
-                # Initialize tkinter and hide the main window
-                root = tk.Tk()
-                root.withdraw()
-                
-                # Show directory selection dialog
-                print("Please select a folder to save the timetable...")
-                save_dir = filedialog.askdirectory(title="Select folder to save timetable")
-                
-                # Clean up tkinter
-                root.destroy()
-                
-                if save_dir:
-                    print(f"Selected save location: {save_dir}")
-                    return save_dir
-                else:
-                    print("No folder selected. Using default location.")
-                    return default_folder
-            except Exception as e:
-                print(f"Error using folder dialog: {e}")
-                
-                # Fallback to manual input if dialog fails
-                custom_path = input("Enter full path to save folder: ")
-                if custom_path and os.path.exists(custom_path):
-                    return custom_path
-                else:
-                    if custom_path:
-                        try:
-                            os.makedirs(custom_path)
-                            print(f"Created folder: {custom_path}")
-                            return custom_path
-                        except Exception as e:
-                            print(f"Could not create folder: {e}")
-                    
-                    print("Using default location.")
-                    return default_folder
     
     def conversation_loop(self):
         """Main conversation loop to collect data from user"""
@@ -527,17 +797,17 @@ class TimeTableGenerator:
                     self.get_llm_response(
                         f"The user wants to correct: {correction}. Please ask for the correct information.")
                     print(f"\nLLM: {self.conversation_history[-1]['content']}")
-            else:
-                response = self.get_llm_response(user_input)
-                print(f"\nLLM: {response}")
+                    return False  # Not ready to generate timetable, needs correction
 
     def generate_timetable(self, template_path=None):
         """Generate timetable using the LLM based on collected information"""
         print("\n===== GENERATING TIMETABLE =====")
         print("Using collected information to generate timetable...")
         
-        # Ask user where to save the timetable
-        output_folder = self.get_save_location()
+        # Use the default timetables folder
+        if not os.path.exists(self.csv_saver.default_folder):
+            os.makedirs(self.csv_saver.default_folder)
+            print(f"Created timetables folder: {os.path.abspath(self.csv_saver.default_folder)}")
         
         template_info = None
         if template_path:
@@ -582,13 +852,15 @@ class TimeTableGenerator:
             ```
             
             CRITICAL REQUIREMENTS:
-            1. The timetable MUST cover the entire period from {start_date} to {end_date}
+            1. The timetable MUST cover the ENTIRE period from {start_date} to {end_date} WITHOUT EXCEPTION
             2. You need to interpret these dates correctly and convert them to DD-MMM format (e.g., 24-Mar)
             3. Each date in the timetable MUST be consecutive days within this date range 
             4. Day of the week must be accurate for each date
             5. Maintain EXACTLY the same structure as the template
             6. Keep the same time slots and batch structure
             7. Use the faculty expertise information to assign appropriate teachers
+            8. IMPORTANT: You MUST include ALL dates from {start_date} through {end_date} inclusive
+            9. IMPORTANT: The timetable is INCOMPLETE if it doesn't reach {end_date}
             
             Institute: {self.user_data.get("institute_name", "Your Institute")}
             Faculty: {json.dumps(self.user_data.get("faculty", []))}
@@ -613,9 +885,12 @@ class TimeTableGenerator:
     
             CRITICAL REQUIREMENTS:
             1. The timetable MUST start on {start_date} and end on {end_date}
-            2. Each date in the timetable MUST be consecutive days within this range
-            3. Dates must be in DD-MMM format (e.g., 24-Mar) in the first column
-            4. Day of the week must be accurate for each date
+            2. The timetable MUST cover the ENTIRE date range from {start_date} to {end_date} WITHOUT EXCEPTION
+            3. IMPORTANT: You MUST include ALL dates from {start_date} through {end_date} inclusive
+            4. IMPORTANT: The timetable is INCOMPLETE if it doesn't reach {end_date}
+            5. Each date in the timetable MUST be consecutive days within this range
+            6. Dates must be in DD-MMM format (e.g., 24-Mar) in the first column
+            7. Day of the week must be accurate for each date
             
             I need you to create a timetable with this exact format:
             ```
@@ -648,110 +923,63 @@ class TimeTableGenerator:
             )
     
         # Get timetable from LLM (may need multiple attempts for complex schedules)
-        max_attempts = 3
+        max_attempts = 5  # Increased from 3 to 5 to give more chances to get it right
         for attempt in range(max_attempts):
             print(f"\nAttempt {attempt + 1}/{max_attempts}...")
-    
+        
             response = self.get_llm_response(generation_prompt)
             csv_content = self.extract_csv_from_response(response)
-    
+        
+            # First check if the CSV format is valid
             if csv_content and self.validate_csv(csv_content):
-                # We'll trust the LLM to include the correct dates 
-                # instead of trying to validate date formats ourselves
+                # Then validate that it covers the entire date range
+                date_range_valid = self.validate_date_range(csv_content, start_date, end_date)
                 
-                # Prepare filename with date range and institute name
-                institute_name = self.user_data.get("institute_name", "Institute").replace(" ", "_")
-                batch_info = ""
-                
-                # Include batch name in filename if available
-                if self.user_data.get("batch_names"):
-                    batch = self.user_data.get("batch_names")[0] if isinstance(self.user_data.get("batch_names"), list) else self.user_data.get("batch_names")
-                    batch_info = f"_{batch.replace(' ', '_')}"
-                
-                # Create filename with date range
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                if start_date and end_date:
-                    # Convert dates to clean format for filename - replace any punctuation
-                    start_clean = start_date.replace("/", "-").replace(" ", "_").replace(",", "")
-                    end_clean = end_date.replace("/", "-").replace(" ", "_").replace(",", "")
-                    filename = f"{institute_name}{batch_info}_timetable_{start_clean}_to_{end_clean}.csv"
-                else:
-                    # Fallback to timestamp
-                    filename = f"{institute_name}{batch_info}_timetable_{timestamp}.csv"
-                
-                # Full path to save file
-                filepath = os.path.join(output_folder, filename)
-                
-                try:
-                    # Ensure the path exists
-                    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+                if date_range_valid:
+                    # Use the CsvSaver to save the generated timetable
+                    institute_name = self.user_data.get("institute_name", "Institute")
+                    batch_info = self.user_data.get("batch_names", [])
                     
-                    # Save the file
-                    with open(filepath, "w", newline='', encoding='utf-8') as f:
-                        f.write(csv_content)
+                    # Save the CSV file using the CsvSaver
+                    success, filepath, error = self.csv_saver.save_csv(
+                        csv_content=csv_content,
+                        institute_name=institute_name,
+                        batch_info=batch_info,
+                        start_date=start_date,
+                        end_date=end_date
+                    )
                     
-                    # Get full absolute path to display to user
-                    full_path = os.path.abspath(filepath)
-                    
-                    print(f"\n✅ Timetable successfully generated and saved!")
-                    print(f"📄 File: {filename}")
-                    print(f"📁 Location: {full_path}")
-                    
-                    # Try to make a backup copy just in case
-                    backup_folder = os.path.join(os.path.dirname(full_path), "backups")
-                    try:
-                        if not os.path.exists(backup_folder):
-                            os.makedirs(backup_folder)
-                        backup_path = os.path.join(backup_folder, f"backup_{filename}")
-                        shutil.copy2(filepath, backup_path)
-                        print(f"💾 Backup copy saved to: {backup_path}")
-                    except Exception as e:
-                        # Non-critical error, just log it
-                        print(f"Note: Could not create backup: {e}")
-                    
-                    # Preview the timetable
-                    print("\n===== SAMPLE OF GENERATED TIMETABLE =====")
-                    preview_lines = csv_content.split('\n')[:10]
-                    for line in preview_lines:
-                        print(line)
-                    
-                    # Offer to open the folder
-                    if input("\nWould you like to open the folder containing the file? (y/n): ").lower() == 'y':
-                        try:
-                            folder_path = os.path.dirname(full_path)
-                            if os.name == 'nt':  # Windows
-                                os.startfile(folder_path)
-                            else:  # macOS or Linux
-                                import subprocess
-                                if os.name == 'posix':
-                                    if 'darwin' in os.sys.platform:  # macOS
-                                        subprocess.call(['open', folder_path])
-                                    else:  # Linux
-                                        subprocess.call(['xdg-open', folder_path])
-                            print(f"Opened folder: {folder_path}")
-                        except Exception as e:
-                            print(f"Could not open folder: {e}")
-                    
-                    return True
-                except Exception as e:
-                    print(f"\n❌ Error saving file: {e}")
-                    
-                    # Try saving to current directory as fallback
-                    try:
-                        fallback_path = os.path.join(os.getcwd(), filename)
-                        with open(fallback_path, "w", newline='', encoding='utf-8') as f:
-                            f.write(csv_content)
-                        print(f"Saved to current directory instead: {fallback_path}")
+                    # Return success or failure
+                    if success:
+                        print("\nTimetable generation and saving complete!")
                         return True
-                    except Exception as e2:
-                        print(f"Failed to save file to fallback location: {e2}")
+                    else:
+                        print(f"\nError saving timetable: {error}")
                         return False
+                else:
+                    print("\nThe generated timetable does not cover the entire requested date range. Retrying...")
+                    
+                    # Add more specific instructions about date range
+                    generation_prompt += f"""
+        
+                    CRITICAL: The previous attempt did not cover the ENTIRE date range correctly.
+                    The timetable MUST:
+                    1. Start EXACTLY on {start_date}
+                    2. End EXACTLY on {end_date}
+                    3. Include ALL dates from {start_date} to {end_date} inclusive
+                    4. Have the correct day of the week for each date
+                    
+                    This is the MOST IMPORTANT requirement. The timetable is incomplete if it doesn't 
+                    include entries for every day in the requested date range.
+                    
+                    Return ONLY the CSV content with the complete date range.
+                    """
             else:
                 print("\nThe generated timetable was not in valid CSV format. Retrying...")
-    
+        
                 # Provide more specific instructions for the next attempt
                 generation_prompt += f"""
-    
+        
                 The previous attempt did not produce a valid CSV. Please ensure:
                 1. No explanatory text before or after the CSV content
                 2. Consistent number of columns in each row
@@ -759,11 +987,27 @@ class TimeTableGenerator:
                 4. At least 3 rows (headers + data)
                 5. The first date in the timetable MUST be {start_date}
                 6. The last date in the timetable MUST be {end_date}
+                7. EVERY date from {start_date} to {end_date} must be included
 
                 Return ONLY the CSV content.
                 """
 
         print("\nFailed to generate a valid timetable after multiple attempts.")
+        
+        # Add a suggestion for manual verification
+        print("\nPlease verify that the date range is specified in a recognizable format:")
+        print(f"Start date: {start_date}")
+        print(f"End date: {end_date}")
+        print("\nTip: Consider formatting dates as 'DD-MM-YYYY' or 'YYYY-MM-DD' for best results.")
+        
+        # Try to install dateutil if it's not available
+        try:
+            import pip
+            pip.main(['install', 'python-dateutil'])
+            print("Installed python-dateutil package for better date parsing.")
+        except:
+            print("Note: For better date parsing, consider installing the python-dateutil package.")
+        
         return False
 
 
