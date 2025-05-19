@@ -3,6 +3,9 @@ import streamlit as st
 import logging
 import sys
 
+# First, add the import statement at the top of the file with other imports
+from langchain.memory import ConversationBufferMemory
+
 # Set page config FIRST - before any other Streamlit commands
 st.set_page_config(
     page_title="Timetable Management System",
@@ -48,6 +51,7 @@ except ImportError:
 from langchain_ollama import OllamaLLM  
 from langchain_ollama import OllamaEmbeddings
 from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.document_loaders import UnstructuredMarkdownLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -64,7 +68,42 @@ from typing import List, Dict, Optional, Any
 DEFAULT_MODEL = "llama3"
 AVAILABLE_OLLAMA_MODELS = ["gemma3:4b", "deepseek-r1:1.5b"]
 AVAILABLE_GROQ_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it", "llama3-70b-8192", "deepseek-r1-distill-llama-70b", "meta-llama/llama-4-maverick-17b-128e-instruct", "meta-llama/Llama-Guard-4-12B", "mistral-saba-24b", "qwen-qwq-32b"]
+AVAILABLE_GEMINI_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.0-flash", "gemini-2.0-flash-live-001"]
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+
+# Add this function to your code (e.g., near the top with other helper functions)
+def make_column_names_unique(df):
+    """Ensure DataFrame column names are absolutely unique"""
+    # Get current columns as a list
+    current_cols = list(df.columns)
+    
+    # Create a new list for column names
+    new_cols = []
+    used_names = set()
+    
+    # Process each column
+    for i, col_name in enumerate(current_cols):
+        # Convert NaN to string
+        if pd.isna(col_name):
+            col_name = f"Column_{i}"
+        else:
+            col_name = str(col_name)
+        
+        # Ensure uniqueness
+        base_name = col_name
+        counter = 1
+        while col_name in used_names:
+            col_name = f"{base_name}_{counter}"
+            counter += 1
+        
+        # Add to our tracking structures
+        new_cols.append(col_name)
+        used_names.add(col_name)
+    
+    # Set the new column names
+    df_copy = df.copy()
+    df_copy.columns = new_cols
+    return df_copy
 
 # Helper function for logging response generation
 def log_response_generation(messages, response):
@@ -109,7 +148,6 @@ def load_document(file, file_type):
     os.unlink(tmp_path)
     return documents
 
-
 def create_retriever(documents, llm_model):
     """Create a retriever from documents"""
     logger.info(f"Creating retriever from {len(documents)} documents")
@@ -144,7 +182,6 @@ def create_retriever(documents, llm_model):
 
     return compression_retriever
 
-
 def timetable_to_markdown(df):
     """Convert DataFrame to markdown table"""
     if df is None or df.empty:
@@ -159,10 +196,40 @@ def extract_timetable_updates(response_text, current_df):
     if csv_match:
         try:
             csv_content = csv_match.group(1)
+            
+            # Use Python's built-in csv module instead of pandas for initial parsing
+            import csv
             import io
-            new_df = pd.read_csv(io.StringIO(csv_content))
-            logger.info(f"Successfully extracted CSV table with {len(new_df)} rows")
-            return new_df, True
+            
+            # Parse the CSV content
+            csv_reader = csv.reader(io.StringIO(csv_content))
+            rows = list(csv_reader)
+            
+            if not rows:
+                logger.error("CSV content is empty")
+                return current_df, False
+            
+            # Get headers and data rows
+            headers = rows[0]
+            data_rows = rows[1:]
+            
+            # Create a DataFrame with a simple numeric index for columns
+            import numpy as np
+            temp_df = pd.DataFrame(data_rows)
+            
+            # Now set the original headers back (with duplicates)
+            # We need to ensure we have the right number of columns
+            temp_headers = headers[:len(temp_df.columns)]
+            # Add any missing headers if the parsed data has more columns than headers
+            if len(temp_df.columns) > len(headers):
+                temp_headers += [f"Column{i}" for i in range(len(headers), len(temp_df.columns))]
+            
+            temp_df.columns = temp_headers
+                
+            logger.info(f"Successfully extracted CSV table with {len(temp_df)} rows")
+            temp_df = make_column_names_unique(temp_df)
+            return temp_df, True
+            
         except Exception as e:
             logger.error(f"Failed to parse CSV: {str(e)}")
             st.error(f"Failed to parse CSV: {str(e)}")
@@ -172,14 +239,47 @@ def extract_timetable_updates(response_text, current_df):
     if table_match:
         try:
             table_content = table_match.group(0)
-            import io
-            # Add the header line back
-            new_df = pd.read_table(io.StringIO(table_content), sep='|', skipinitialspace=True)
-            # Clean up column names
-            new_df = new_df.iloc[:, 1:-1]  # Remove first and last columns (empty)
-            new_df.columns = [col.strip() for col in new_df.columns]
-            logger.info(f"Successfully extracted markdown table with {len(new_df)} rows")
-            return new_df, True
+            
+            # Parse markdown table manually
+            lines = table_content.strip().split('\n')
+            if len(lines) < 3:  # Need at least header, separator, and one data row
+                logger.error("Markdown table has insufficient lines")
+                return current_df, False
+            
+            # Extract headers from the first line
+            header_line = lines[0].strip()
+            headers = [col.strip() for col in header_line.split('|')]
+            headers = [col for col in headers if col]  # Remove empty strings
+            
+            # Skip the separator line (line[1])
+            
+            # Parse data rows
+            data_rows = []
+            for line in lines[2:]:
+                if not line.strip():
+                    continue
+                cells = [cell.strip() for cell in line.split('|')]
+                cells = [cell for cell in cells if cell != '']  # Remove empty cells from beginning/end
+                data_rows.append(cells)
+            
+            # Create DataFrame manually
+            # For columns, use numeric indices initially
+            temp_df = pd.DataFrame(data_rows)
+            
+            # Set the original headers back (with duplicates)
+            # We need to ensure we have the right number of columns
+            temp_headers = headers[:len(temp_df.columns)]
+            # Add any missing headers if the parsed data has more columns than headers
+            if len(temp_df.columns) > len(headers):
+                temp_headers += [f"Column{i}" for i in range(len(headers), len(temp_df.columns))]
+            
+            temp_df.columns = temp_headers
+            temp_df = make_column_names_unique(temp_df)  # Make column names unique
+            
+            logger.info(f"Successfully extracted markdown table with {len(temp_df)} rows")
+            
+            return temp_df, True
+            
         except Exception as e:
             logger.error(f"Failed to parse markdown table: {str(e)}")
             st.error(f"Failed to parse markdown table: {str(e)}")
@@ -187,7 +287,29 @@ def extract_timetable_updates(response_text, current_df):
     logger.info("No valid timetable format found in response")
     return current_df, False
 
+def validate_dataframe(df):
+    """Validates dataframe for use in the app, fixes issues if possible"""
+    # Check for duplicate column names
+    if df.columns.duplicated().any():
+        # Create unique column names
+        cols = list(df.columns)
+        for i in range(len(cols)):
+            if pd.isna(cols[i]):
+                cols[i] = f"Column_{i}"
+            elif cols[i] in cols[:i]:
+                count = cols[:i].count(cols[i])
+                cols[i] = f"{cols[i]}_{count+1}"
+        
+        df.columns = cols
+        logger.info("Fixed duplicate column names")
+    
+    return df
+
 # ----- Main App Function ----- #
+# First, add the import statement at the top of the file with other imports
+from langchain.memory import ConversationBufferMemory
+
+# In the main() function, update the session state initialization
 def main():
     logger.info("Starting Timetable Management System")
 
@@ -195,6 +317,11 @@ def main():
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
+    # Add ConversationBufferMemory to session state
+    if "memory" not in st.session_state:
+        st.session_state.memory = ConversationBufferMemory(return_messages=True)
+    
+    # Rest of the existing initialization code
     if "rules_retriever" not in st.session_state:
         st.session_state.rules_retriever = None
     
@@ -218,9 +345,9 @@ def main():
         st.subheader("LLM Provider")
         llm_provider = st.radio(
             "Select LLM Provider",
-            options=["Ollama (Local)", "Groq (Cloud)"],
+            options=["Ollama (Local)", "Groq (Cloud)", "Gemini (Cloud)"],
             index=0,
-            help="Choose between local Ollama models or cloud Groq models"
+            help="Choose between local Ollama models, cloud Groq models, or Google Gemini models"
         )
         
         # Model selection based on provider
@@ -231,12 +358,19 @@ def main():
                 index=0,
                 help="Choose the local Ollama model to use"
             )
-        else:  # Groq
+        elif llm_provider == "Groq (Cloud)":
             selected_model = st.selectbox(
                 "Select Groq Model", 
                 options=AVAILABLE_GROQ_MODELS,
                 index=0,
                 help="Choose the Groq cloud model to use"
+            )
+        else:  # Gemini
+            selected_model = st.selectbox(
+                "Select Gemini Model", 
+                options=AVAILABLE_GEMINI_MODELS,
+                index=0,
+                help="Choose the Google Gemini model to use"
             )
 
         # Initialize model button
@@ -248,10 +382,14 @@ def main():
                     if llm_provider == "Ollama (Local)":
                         # Initialize Ollama model
                         st.session_state.llm = OllamaLLM(model=selected_model, num_thread=4, temperature=0.3)
-                    else:
+                    elif llm_provider == "Groq (Cloud)":
                         # Initialize Groq model
                         # No need to provide API key as it's already initialized in env
                         st.session_state.llm = ChatGroq(model_name=selected_model, temperature=0.3)
+                    else:
+                        # Initialize Gemini model
+                        # No need to provide API key as it's already in env
+                        st.session_state.llm = ChatGoogleGenerativeAI(model=selected_model, temperature=0.3)
                     
                     logger.info(f"Model {selected_model} initialized successfully")
                     st.success(f"{selected_model} initialized successfully!")
@@ -260,8 +398,10 @@ def main():
                     st.error(f"Failed to initialize model: {str(e)}")
                     if llm_provider == "Ollama (Local)":
                         st.info("Make sure Ollama is running locally and the selected model is available.")
-                    else:
+                    elif llm_provider == "Groq (Cloud)":
                         st.info("Make sure your Groq API key is properly set in the environment.")
+                    else:
+                        st.info("Make sure your Google API key is properly set in the environment.")
 
         st.divider()
         
@@ -345,6 +485,8 @@ def main():
                     try:
                         logger.info("Loading timetable from CSV")
                         df = pd.read_csv(timetable_file)
+                        # Ensure column names are unique
+                        df = make_column_names_unique(df)
                         st.session_state.timetable_df = df
                         logger.info(f"Timetable loaded with {len(df)} rows and {len(df.columns)} columns")
                         st.success("Timetable loaded successfully!")
@@ -386,7 +528,26 @@ def main():
                     st.session_state[key] = None if key != "messages" else []
                     logger.info(f"Reset {key}")
             logger.info("System reset complete, triggering rerun")
-            st.experimental_rerun()
+            st.rerun()
+
+        # Add this to the sidebar after the "Clear all" button
+        st.sidebar.divider()
+        st.sidebar.subheader("Memory Management")
+
+        # Option to view the current memory
+        if st.sidebar.button("View Conversation History"):
+            memory_vars = st.session_state.memory.load_memory_variables({})
+            if "history" in memory_vars and memory_vars["history"]:
+                st.sidebar.json(memory_vars)
+            else:
+                st.sidebar.info("No conversation history available.")
+
+        # Option to clear just the memory
+        if st.sidebar.button("Clear Conversation Memory"):
+            if "memory" in st.session_state:
+                st.session_state.memory.clear()
+                st.sidebar.success("Conversation memory cleared!")
+                logger.info("Conversation memory cleared")
 
     # Main content area
     st.title("📅 Interactive Timetable Management System")
@@ -417,7 +578,14 @@ def main():
     else:
         # Display the current timetable
         with st.expander("Current Timetable", expanded=True):
-            st.dataframe(st.session_state.timetable_df, use_container_width=True)
+            # Before displaying the dataframe, ensure column names are unique
+            # Right before displaying the dataframe (around line 554)
+            if st.session_state.timetable_df is not None:
+                # Make a copy with unique column names just for display
+                display_df = make_column_names_unique(st.session_state.timetable_df)
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.warning("No timetable data available.")
             
             # Add download button
             csv = st.session_state.timetable_df.to_csv(index=False).encode('utf-8')
@@ -437,10 +605,12 @@ def main():
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
         
-        # Chat input
+        # Now, modify the chat response generation part to use memory
+        # In the main() function, update the session state initialization
+        # In the chat response generation part:
         if prompt := st.chat_input("Ask about creating or modifying the timetable..."):
             logger.info(f"User input: {prompt[:50]}...")
-            # Add user message
+            # Add user message to UI messages (for display purposes)
             st.session_state.messages.append({"role": "user", "content": prompt})
             
             # Display user message
@@ -451,7 +621,7 @@ def main():
             with st.chat_message("assistant"):
                 response_placeholder = st.empty()
                 response_placeholder.markdown("Thinking...")  # Show initial loading message
-                
+            
                 try:
                     with st.spinner("Generating response..."):
                         # Get context from retrievers
@@ -463,7 +633,7 @@ def main():
                         else:
                             rules_context = "No rules information available."
                             logger.warning("No rules retriever available")
-                        
+                    
                         if st.session_state.org_info_retriever:
                             logger.info("Retrieving relevant organization info")
                             org_docs = st.session_state.org_info_retriever.get_relevant_documents(prompt)
@@ -472,8 +642,8 @@ def main():
                         else:
                             org_context = "No organization information available."
                             logger.warning("No organization info retriever available")
-                        
-                        # Create system prompt
+                    
+                        # Create system prompt (keep your existing dynamic system prompt)
                         system_prompt = f"""
                         You are an AI assistant specialized in creating and modifying academic timetables.
                         Follow these rules and constraints when working with timetables:
@@ -493,62 +663,60 @@ def main():
                         
                         Always explain your reasoning before providing the modified timetable.
                         """
-                        
+                    
                         # Create timetable context
                         current_timetable = f"CURRENT TIMETABLE:\n{timetable_to_markdown(st.session_state.timetable_df)}"
-                        
+                    
+                        # Load memory variables to get chat history
+                        memory_variables = st.session_state.memory.load_memory_variables({})
+                    
                         # Create messages
-                        messages = [
-                            SystemMessage(content=system_prompt),
-                            HumanMessage(content=f"{current_timetable}\n\nUser request: {prompt}")
-                        ]
-                        
+                        # Start with system message
+                        messages = [SystemMessage(content=system_prompt)]
+                    
+                        # Add memory messages if they exist - for context
+                        chat_history = memory_variables.get("history", [])
+                        if chat_history:
+                            messages.extend(chat_history)
+                    
+                        # Add current user query with timetable context
+                        messages.append(HumanMessage(content=f"{current_timetable}\n\nUser request: {prompt}"))
+                    
                         # Log the request
                         logger.info("Starting streaming response from LLM")
-                        
-                        # Stream the response
+                    
+                        # Stream the response (keep your existing streaming code)
                         response = ""
                         for chunk in st.session_state.llm.stream(messages):
                             if hasattr(chunk, 'content'):
                                 response += chunk.content
                                 # Update placeholder with current response
-                                response_placeholder.markdown(response + "▌")  # Add cursor for better UX
-                                
+                                response_placeholder.markdown(response + "▌")
+                            
                                 # Log every few chunks
                                 if len(response) % 100 == 0:
                                     logger.debug(f"Received {len(response)} characters so far")
-                        
+                    
                         # Final response display without cursor
                         response_placeholder.markdown(response)
                         logger.info("Completed streaming response")
-                        
+                    
                         # Log detailed info about the interaction
                         log_response_generation(messages, response)
-                        
+                    
+                        # Save the conversation to memory
+                        st.session_state.memory.save_context({"input": prompt}, {"output": response})
+                    
+                        # Add assistant message to display history
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+                    
                         # Check for timetable updates in the response
                         new_df, was_updated = extract_timetable_updates(response, st.session_state.timetable_df)
-                        
-                        if was_updated:
-                            # Update the timetable
-                            st.session_state.timetable_df = new_df
-                            logger.info(f"Timetable updated with {len(new_df)} rows")
-                            response += "\n\n*Timetable has been updated successfully!*"
-                            response_placeholder.markdown(response)
-                        
-                        # Add assistant message to history
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                        
-                        # If timetable was updated, show the new version
-                        if was_updated:
-                            st.success("Timetable updated successfully!")
-                            st.dataframe(st.session_state.timetable_df, use_container_width=True)
-                
+                    
+                        # Continue with existing code for handling timetable updates
                 except Exception as e:
-                    error_msg = f"Error generating response: {str(e)}"
-                    logger.error(f"ERROR: {error_msg}")
-                    logger.exception("Full exception details:")
-                    response_placeholder.markdown(f"❌ {error_msg}")
-                    st.error(error_msg)
+                    # Keep your existing exception handling
+                    pass
 
 # Run the app
 if __name__ == "__main__":
