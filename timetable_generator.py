@@ -2,6 +2,7 @@ import os
 import streamlit as st
 import logging
 import sys
+from csv_database import CSVDatabase
 
 # First, add the import statement at the top of the file with other imports
 from langchain.memory import ConversationBufferMemory
@@ -66,6 +67,7 @@ import tempfile
 import json
 import re
 from typing import List, Dict, Optional, Any
+from datetime import datetime
 
 # ----- Constants ----- #
 DEFAULT_MODEL = "llama3"
@@ -336,6 +338,11 @@ def main():
     if "memory" not in st.session_state:
         st.session_state.memory = ConversationBufferMemory(return_messages=True)
 
+    # Initialize the CSV database
+    if "db" not in st.session_state:
+        st.session_state.db = CSVDatabase(db_dir="timetables")
+        logger.info("CSV Database initialized in session state")
+
     # Rest of the existing initialization code
     if "rules_retriever" not in st.session_state:
         st.session_state.rules_retriever = None
@@ -351,6 +358,10 @@ def main():
 
     if "embedding_model" not in st.session_state:
         st.session_state.embedding_model = None
+        
+    # Add active table name to session state
+    if "active_table" not in st.session_state:
+        st.session_state.active_table = None
 
     # Create sidebar
     with st.sidebar:
@@ -568,6 +579,112 @@ def main():
     # Main content area
     st.title("📅 Interactive Timetable Management System")
 
+    # Add tabs for different sections
+    main_tab, database_tab = st.tabs(["Main Interface", "Database Management"])
+    
+    # Database Management Tab
+    with database_tab:
+        st.header("CSV Database Management")
+        
+        # Add table operations
+        st.subheader("Available Tables")
+        available_tables = st.session_state.db.list_tables()
+        
+        if not available_tables:
+            st.info("No tables found in the database. Create a new table to get started.")
+        else:
+            # Create a grid of table cards
+            col_count = 3  # Number of columns in the grid
+            cols = st.columns(col_count)
+            
+            for i, table_name in enumerate(available_tables):
+                col_idx = i % col_count
+                with cols[col_idx]:
+                    with st.container(border=True):
+                        st.write(f"**{table_name}**")
+                        
+                        # Get and display metadata
+                        metadata = st.session_state.db.get_table_metadata(table_name)
+                        if metadata:
+                            st.write(f"Rows: {metadata['rows']}")
+                            st.write(f"Columns: {metadata['column_count']}")
+                            st.write(f"Size: {metadata['file_size_kb']:.2f} KB")
+                            
+                            # Actions
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if st.button(f"View {table_name}", key=f"view_{table_name}"):
+                                    df = st.session_state.db.read_table(table_name)
+                                    if df is not None:
+                                        st.session_state.timetable_df = df
+                                        st.session_state.active_table = table_name
+                                        st.success(f"Loaded table {table_name}")
+                                        st.rerun()
+                            with col2:
+                                if st.button(f"Export {table_name}", key=f"export_{table_name}"):
+                                    df = st.session_state.db.read_table(table_name)
+                                    if df is not None:
+                                        csv = df.to_csv(index=False).encode('utf-8')
+                                        st.download_button(
+                                            f"Download {table_name}.csv",
+                                            csv,
+                                            f"{table_name}.csv",
+                                            "text/csv",
+                                            key=f'download-{table_name}'
+                                        )
+        
+        # Add table preview section
+        if st.session_state.active_table:
+            st.subheader(f"Preview of '{st.session_state.active_table}'")
+            df = st.session_state.db.read_table(st.session_state.active_table)
+            if df is not None:
+                st.dataframe(df, use_container_width=True)
+                
+                # Add backup option
+                st.button(
+                    "Backup This Table", 
+                    on_click=lambda: st.session_state.db._backup_table(st.session_state.active_table),
+                    key="backup_active_table"
+                )
+                
+                # Show backup history
+                backups = st.session_state.db.list_backups(st.session_state.active_table)
+                if backups and st.session_state.active_table in backups:
+                    with st.expander("Backup History"):
+                        st.write(f"Found {len(backups[st.session_state.active_table])} backups")
+                        for timestamp in backups[st.session_state.active_table]:
+                            st.write(f"- {timestamp}")
+        
+        # Add import/export section
+        st.subheader("Import/Export")
+        
+        # Import from file
+        with st.expander("Import Table from File"):
+            upload_file = st.file_uploader("Select CSV file to import", type=["csv"])
+            if upload_file:
+                import_name = st.text_input("Table Name", 
+                                           value=upload_file.name.split('.')[0] if '.' in upload_file.name else "imported_table")
+                overwrite = st.checkbox("Overwrite if exists")
+                
+                if st.button("Import File"):
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
+                            tmp_file.write(upload_file.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        if st.session_state.db.import_table(import_name, tmp_path, format="csv", overwrite=overwrite):
+                            st.success(f"Successfully imported '{import_name}'")
+                            # Clean up temp file
+                            os.unlink(tmp_path)
+                            # Rerun to refresh the UI
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to import table")
+                            # Clean up temp file
+                            os.unlink(tmp_path)
+                    except Exception as e:
+                        st.error(f"Import error: {str(e)}")
+    
     # Check if all components are ready
     all_ready = all([
         st.session_state.llm,
@@ -576,32 +693,35 @@ def main():
         st.session_state.org_info_retriever,
         st.session_state.timetable_df is not None
     ])
+    
+    # Continue with main interface in the main tab
+    with main_tab:
 
-    if not all_ready:
-        st.warning("⚠️ Please initialize all components in the sidebar before proceeding.")
+        if not all_ready:
+            st.warning("⚠️ Please initialize all components in the sidebar before proceeding.")
 
-        # Show component that needs attention
-        if not st.session_state.llm:
-            st.info("➡️ Initialize the LLM model first")
-        elif not st.session_state.embedding_model:
-            st.info("➡️ Initialize the embedding model")
-        elif not st.session_state.rules_retriever:
-            st.info("➡️ Upload and process the rules document")
-        elif not st.session_state.org_info_retriever:
-            st.info("➡️ Upload and process the organization information")
-        elif st.session_state.timetable_df is None:
-            st.info("➡️ Upload and load the timetable structure")
-    else:
-        # Display the current timetable
-        with st.expander("Current Timetable", expanded=True):
-            # Before displaying the dataframe, ensure column names are unique
-            # Right before displaying the dataframe (around line 554)
-            if st.session_state.timetable_df is not None:
-                # Make a copy with unique column names just for display
-                display_df = make_column_names_unique(st.session_state.timetable_df)
-                st.dataframe(display_df, use_container_width=True)
-            else:
-                st.warning("No timetable data available.")
+            # Show component that needs attention
+            if not st.session_state.llm:
+                st.info("➡️ Initialize the LLM model first")
+            elif not st.session_state.embedding_model:
+                st.info("➡️ Initialize the embedding model")
+            elif not st.session_state.rules_retriever:
+                st.info("➡️ Upload and process the rules document")
+            elif not st.session_state.org_info_retriever:
+                st.info("➡️ Upload and process the organization information")
+            elif st.session_state.timetable_df is None:
+                st.info("➡️ Upload and load the timetable structure")
+        else:
+            # Display the current timetable
+            with st.expander("Current Timetable", expanded=True):
+                # Before displaying the dataframe, ensure column names are unique
+                # Right before displaying the dataframe (around line 554)
+                if st.session_state.timetable_df is not None:
+                    # Make a copy with unique column names just for display
+                    display_df = make_column_names_unique(st.session_state.timetable_df)
+                    st.dataframe(display_df, use_container_width=True)
+                else:
+                    st.warning("No timetable data available.")
 
             # Add download button
             csv = st.session_state.timetable_df.to_csv(index=False).encode('utf-8')
@@ -737,6 +857,48 @@ def main():
                             # Show success message
                             st.success("✅ Timetable has been updated successfully!")
 
+                            # Auto-save to database if there's an active table
+                            if st.session_state.active_table:
+                                try:
+                                    # Update the table in the database
+                                    if st.session_state.db.write_table(st.session_state.active_table, new_df):
+                                        st.success(f"✅ Changes automatically saved to database table '{st.session_state.active_table}'")
+                                        logger.info(f"Auto-saved changes to database table '{st.session_state.active_table}'")
+                                    else:
+                                        st.warning(f"⚠️ Could not auto-save changes to table '{st.session_state.active_table}'")
+                                except Exception as e:
+                                    st.warning(f"⚠️ Error auto-saving to database: {str(e)}")
+                            else:
+                                # Offer to save to a new or existing table
+                                with st.expander("Save to Database", expanded=True):
+                                    save_options = ["New Table"] + st.session_state.db.list_tables()
+                                    save_target = st.selectbox(
+                                        "Save to:",
+                                        options=save_options
+                                    )
+                                    
+                                    if st.button("Save Timetable to Database"):
+                                        if save_target == "New Table":
+                                            # Generate a timestamped table name
+                                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            new_table_name = f"timetable_{timestamp}"
+                                            
+                                            # Create new table
+                                            if st.session_state.db.create_table(new_table_name, new_df):
+                                                st.success(f"✅ Saved to new table '{new_table_name}'")
+                                                st.session_state.active_table = new_table_name
+                                                logger.info(f"Created new database table '{new_table_name}'")
+                                            else:
+                                                st.error("❌ Failed to create new table")
+                                        else:
+                                            # Update existing table
+                                            if st.session_state.db.write_table(save_target, new_df):
+                                                st.success(f"✅ Updated existing table '{save_target}'")
+                                                st.session_state.active_table = save_target
+                                                logger.info(f"Updated existing database table '{save_target}'")
+                                            else:
+                                                st.error(f"❌ Failed to update table '{save_target}'")
+                            
                             # Display the updated timetable
                             st.subheader("Updated Timetable")
                             st.dataframe(new_df, use_container_width=True)
@@ -758,6 +920,89 @@ def main():
                     logger.error(f"Error generating response: {error_msg}")
                     response_placeholder.markdown(f"❌ Error: {error_msg}")
                     st.error(f"An error occurred: {error_msg}")
+
+
+
+
+def display_styled_dataframe(df, title=None):
+    """
+    Display a pandas DataFrame with custom styling in Streamlit.
+
+    Args:
+        df: pandas DataFrame to display
+        title: Optional title to display above the table
+    """
+    if df is None or df.empty:
+        st.warning("No data available to display.")
+        return
+
+    # Make a copy to avoid modifying the original
+    display_df = df.copy()
+
+    # Apply styling
+    styled_df = (display_df.style
+        # Add gradient background color based on numeric values (if any)
+        .background_gradient(cmap='Blues', subset=[col for col in display_df.columns
+                                                if pd.api.types.is_numeric_dtype(display_df[col])])
+        # Align text in cells
+        .set_properties(**{
+            'text-align': 'center',
+            'font-weight': 'bold',
+            'border': '1px solid #e1e4e8',
+            'padding': '10px'
+        })
+        # Format headers
+        .set_table_styles([
+            {'selector': 'thead th',
+             'props': [('background-color', '#4CAF50'),
+                      ('color', 'white'),
+                      ('font-weight', 'bold'),
+                      ('text-align', 'center'),
+                      ('padding', '10px'),
+                      ('border', '1px solid #ddd')]},
+        {'selector': 'tbody tr:nth-child(even)',
+         'props': [('background-color', 'rgba(0, 0, 0, 0.05)')]},
+        {'selector': 'tbody tr:hover',
+         'props': [('background-color', 'rgba(66, 165, 245, 0.2)')]}
+    ])
+                 # Set caption/title if provided
+                 .set_caption(title if title else '')
+                 )
+
+    # Convert to HTML and display
+    html_table = styled_df.to_html()
+    html = f"""
+    <style>
+    .dataframe-container {{
+        overflow-x: auto;
+        margin: 1em 0;
+    }}
+    table.dataframe {{
+        border-collapse: collapse;
+        border: none;
+        width: 100%;
+    }}
+    table.dataframe td, table.dataframe th {{
+        text-align: center;
+        padding: 8px;
+    }}
+    </style>
+    <div class="dataframe-container">
+    {html_table}
+    </div>
+    """
+
+    st.html(html, height=400)
+
+    # Also provide a download button
+    csv = display_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "Download as CSV",
+        csv,
+        "timetable.csv",
+        "text/csv",
+        key=f'download-{hash(title)}'
+    )
 
 
 # Run the app
