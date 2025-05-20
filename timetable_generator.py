@@ -60,13 +60,13 @@ from langchain_community.document_loaders import UnstructuredMarkdownLoader, CSV
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.retrievers.document_compressors.chain_extract import LLMChainExtractor
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 import pandas as pd
 import tempfile
 import json
 import re
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple, Union
 from datetime import datetime
 
 # ----- Constants ----- #
@@ -78,6 +78,103 @@ AVAILABLE_GROQ_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mix
                          "mistral-saba-24b", "qwen-qwq-32b"]
 AVAILABLE_GEMINI_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.0-flash", "gemini-2.0-flash-live-001"]
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+
+# Add after the existing constants
+DB_OPERATIONS_PROMPT = """
+You have direct access to the following database operations:
+- CREATE: Create a new table in the database
+- READ: Read data from an existing table
+- UPDATE: Modify data in an existing table
+- DELETE: Remove a table from the database
+- LIST: List all available tables
+- APPEND: Add new rows to an existing table
+
+To perform these operations, use specific formats in your response:
+- To create: `[DB_CREATE]{table_name}[/DB_CREATE]` followed by CSV or markdown table data
+- To read: `[DB_READ]{table_name}[/DB_READ]`
+- To update: `[DB_UPDATE]{table_name}[/DB_UPDATE]` followed by updated CSV or markdown table data
+- To delete: `[DB_DELETE]{table_name}[/DB_DELETE]`
+- To list: `[DB_LIST][/DB_LIST]`
+- To append: `[DB_APPEND]{table_name}[/DB_APPEND]` followed by CSV or markdown table data to append
+
+Example: To create a new table named 'courses':
+[DB_CREATE]courses[/DB_CREATE]
+| Course | Professor | Room |
+|--------|-----------|------|
+| Math   | Smith     | 101  |
+"""
+
+def execute_db_operation(operation: str, content: str) -> Tuple[bool, str]:
+    """Execute database operations based on LLM response."""
+    try:
+        if not operation or not content:
+            return False, "Invalid operation or content"
+
+        if operation == "DB_LIST":
+            tables = st.session_state.db.list_tables()
+            return True, f"Available tables: {', '.join(tables)}"
+
+        # Extract table name from content
+        table_name = content.split(']')[0].split('[')[-1]
+        
+        if operation == "DB_CREATE":
+            df, success = extract_timetable_updates(content, None)
+            if success:
+                result = st.session_state.db.create_table(table_name, df)
+                return result, f"Table '{table_name}' created successfully" if result else f"Failed to create table '{table_name}'"
+
+        elif operation == "DB_READ":
+            df = st.session_state.db.read_table(table_name)
+            if df is not None:
+                return True, df.to_markdown(index=False)
+            return False, f"Failed to read table '{table_name}'"
+
+        elif operation == "DB_UPDATE":
+            df, success = extract_timetable_updates(content, None)
+            if success:
+                result = st.session_state.db.write_table(table_name, df, overwrite=True)
+                return result, f"Table '{table_name}' updated successfully" if result else f"Failed to update table '{table_name}'"
+
+        elif operation == "DB_DELETE":
+            result = st.session_state.db.delete_table(table_name)
+            return result, f"Table '{table_name}' deleted successfully" if result else f"Failed to delete table '{table_name}'"
+
+        elif operation == "DB_APPEND":
+            df, success = extract_timetable_updates(content, None)
+            if success:
+                result = st.session_state.db.append_to_table(table_name, df)
+                return result, f"Data appended to '{table_name}' successfully" if result else f"Failed to append to table '{table_name}'"
+
+        return False, f"Operation {operation} failed"
+    except Exception as e:
+        return False, f"Error executing database operation: {str(e)}"
+
+def process_llm_response(response: str) -> str:
+    """Process LLM response and execute any database operations."""
+    # Define operation patterns
+    operations = {
+        "DB_CREATE": r"\[DB_CREATE\](.*?)\[/DB_CREATE\](.*?)(?=\[DB_|$)",
+        "DB_READ": r"\[DB_READ\](.*?)\[/DB_READ\]",
+        "DB_UPDATE": r"\[DB_UPDATE\](.*?)\[/DB_UPDATE\](.*?)(?=\[DB_|$)",
+        "DB_DELETE": r"\[DB_DELETE\](.*?)\[/DB_DELETE\]",
+        "DB_LIST": r"\[DB_LIST\]\[/DB_LIST\]",
+        "DB_APPEND": r"\[DB_APPEND\](.*?)\[/DB_APPEND\](.*?)(?=\[DB_|$)"
+    }
+
+    modified_response = response
+    for op_name, pattern in operations.items():
+        matches = re.finditer(pattern, response, re.DOTALL)
+        for match in matches:
+            if op_name == "DB_LIST":
+                success, result = execute_db_operation(op_name, "")
+            else:
+                content = match.group(0)
+                success, result = execute_db_operation(op_name, content)
+            
+            # Replace the operation block with the result
+            modified_response = modified_response.replace(match.group(0), f"\n{result}\n")
+
+    return modified_response
 
 
 # Add this function to your code (e.g., near the top with other helper functions)
@@ -411,7 +508,7 @@ def main():
                     elif llm_provider == "Groq (Cloud)":
                         # Initialize Groq model
                         # No need to provide API key as it's already initialized in env
-                        st.session_state.llm = ChatGroq(model_name=selected_model, temperature=0.3)
+                        st.session_state.llm = ChatGroq(model=selected_model, temperature=0.3)
                     else:
                         # Initialize Gemini model
                         # No need to provide API key as it's already in env
@@ -601,7 +698,44 @@ def main():
                 col_idx = i % col_count
                 with cols[col_idx]:
                     with st.container(border=True):
-                        st.write(f"**{table_name}**")
+                        # Use a single row for title and delete button
+                        st.write(f"**{table_name}** {' ' * 10} " + 
+                               f"[:wastebasket:](./?delete={table_name})" if 
+                               not st.session_state.get(f"delete_table_{table_name}") else "")
+                        
+                        # Handle delete confirmation
+                        delete_key = f"delete_table_{table_name}"
+                        
+                        # Check URL parameters for delete action
+                        params = st.experimental_get_query_params()
+                        if params.get("delete") and params["delete"][0] == table_name:
+                            st.session_state[delete_key] = True
+                        
+                        # Show delete confirmation
+                        if st.session_state.get(delete_key):
+                            st.warning(f"Delete '{table_name}'?")
+                            if st.button("✅ Yes", key=f"confirm_delete_{table_name}", type="primary"):
+                                try:
+                                    if st.session_state.db.delete_table(table_name):
+                                        st.success(f"Table '{table_name}' deleted!")
+                                        # Clear active table if it was the deleted one
+                                        if st.session_state.active_table == table_name:
+                                            st.session_state.active_table = None
+                                            st.session_state.timetable_df = None
+                                        st.session_state[delete_key] = False
+                                        # Clear URL parameter
+                                        st.experimental_set_query_params()
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to delete table")
+                                except Exception as e:
+                                    st.error(f"Error: {str(e)}")
+                        
+                            if st.button("❌ No", key=f"cancel_delete_{table_name}"):
+                                st.session_state[delete_key] = False
+                                # Clear URL parameter
+                                st.experimental_set_query_params()
+                                st.rerun()
                         
                         # Get and display metadata
                         metadata = st.session_state.db.get_table_metadata(table_name)
@@ -609,37 +743,96 @@ def main():
                             st.write(f"Rows: {metadata['rows']}")
                             st.write(f"Columns: {metadata['column_count']}")
                             st.write(f"Size: {metadata['file_size_kb']:.2f} KB")
-                            
-                            # Actions
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                if st.button(f"View {table_name}", key=f"view_{table_name}"):
-                                    df = st.session_state.db.read_table(table_name)
-                                    if df is not None:
-                                        st.session_state.timetable_df = df
-                                        st.session_state.active_table = table_name
-                                        st.success(f"Loaded table {table_name}")
-                                        st.rerun()
-                            with col2:
-                                if st.button(f"Export {table_name}", key=f"export_{table_name}"):
-                                    df = st.session_state.db.read_table(table_name)
-                                    if df is not None:
-                                        csv = df.to_csv(index=False).encode('utf-8')
-                                        st.download_button(
-                                            f"Download {table_name}.csv",
-                                            csv,
-                                            f"{table_name}.csv",
-                                            "text/csv",
-                                            key=f'download-{table_name}'
-                                        )
+                        
+                        # Continue with the rest of the table card content
+                        # ...existing code...
         
-        # Add table preview section
+        # Update the table preview section with editing capabilities
         if st.session_state.active_table:
             st.subheader(f"Preview of '{st.session_state.active_table}'")
             df = st.session_state.db.read_table(st.session_state.active_table)
             if df is not None:
-                st.dataframe(df, use_container_width=True)
+                # Add editing mode toggle
+                edit_mode = st.toggle("Enable editing mode", key="edit_mode")
                 
+                if edit_mode:
+                    # Create a copy of the dataframe for editing
+                    edited_df = st.data_editor(
+                        df,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        key=f"editor_{st.session_state.active_table}"
+                    )
+                    
+                    # Add save changes button
+                    if st.button("Save Changes", type="primary"):
+                        try:
+                            # Create backup before saving
+                            st.session_state.db._backup_table(st.session_state.active_table)
+                            
+                            # Save changes to database
+                            if st.session_state.db.write_table(st.session_state.active_table, edited_df):
+                                st.success("✅ Changes saved successfully!")
+                                # Update the timetable_df if this is the active timetable
+                                st.session_state.timetable_df = edited_df
+                            else:
+                                st.error("❌ Failed to save changes")
+                        except Exception as e:
+                            st.error(f"Error saving changes: {str(e)}")
+                else:
+                    # Display read-only view
+                    st.dataframe(df, use_container_width=True)
+                
+                # Add column management
+                with st.expander("Manage Columns"):
+                    # Add new column
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        new_col_name = st.text_input("New column name", key="new_col_name")
+                    with col2:
+                        if st.button("Add Column") and new_col_name:
+                            try:
+                                df[new_col_name] = ""
+                                if st.session_state.db.write_table(st.session_state.active_table, df):
+                                    st.success(f"Added column '{new_col_name}'")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Error adding column: {str(e)}")
+                    
+                    # Delete columns
+                    cols_to_delete = st.multiselect(
+                        "Select columns to delete",
+                        options=list(df.columns),
+                        key="cols_to_delete"
+                    )
+                    if cols_to_delete and st.button("Delete Selected Columns", type="primary"):
+                        try:
+                            df = df.drop(columns=cols_to_delete)
+                            if st.session_state.db.write_table(st.session_state.active_table, df):
+                                st.success("Columns deleted successfully!")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error deleting columns: {str(e)}")
+                
+                # Add row management
+                with st.expander("Manage Rows"):
+                    # Delete rows by index
+                    row_indices = st.multiselect(
+                        "Select rows to delete (by index)",
+                        options=list(range(len(df))),
+                        format_func=lambda x: f"Row {x+1}",
+                        key="rows_to_delete"
+                    )
+                    if row_indices and st.button("Delete Selected Rows", type="primary"):
+                        try:
+                            df = df.drop(index=row_indices).reset_index(drop=True)
+                            if st.session_state.db.write_table(st.session_state.active_table, df):
+                                st.success("Rows deleted successfully!")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error deleting rows: {str(e)}")
+                
+                # Existing backup and history features
                 # Add backup option
                 st.button(
                     "Backup This Table", 
@@ -724,7 +917,15 @@ def main():
                     st.warning("No timetable data available.")
 
             # Add download button
-            csv = st.session_state.timetable_df.to_csv(index=False).encode('utf-8')
+            if st.session_state.timetable_df is not None:
+                csv = st.session_state.timetable_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Download Timetable as CSV",
+                    csv,
+                    "timetable.csv",
+                    "text/csv",
+                    key='download-csv'
+                )
             st.download_button(
                 "Download Timetable as CSV",
                 csv,
@@ -782,6 +983,10 @@ def main():
                         # Create system prompt (keep your existing dynamic system prompt)
                         system_prompt = f"""
                         You are an AI assistant specialized in creating and modifying academic timetables.
+                        You have direct access to the database for managing timetables and related data.
+
+                        {DB_OPERATIONS_PROMPT}
+
                         Follow these rules and constraints when working with timetables:
 
                         RULES AND CONSTRAINTS:
@@ -808,7 +1013,7 @@ def main():
 
                         # Create messages
                         # Start with system message
-                        messages = [SystemMessage(content=system_prompt)]
+                        messages: List[Union[SystemMessage, HumanMessage, AIMessage]] = [SystemMessage(content=system_prompt)]
 
                         # Add memory messages if they exist - for context
                         chat_history = memory_variables.get("history", [])
@@ -821,11 +1026,24 @@ def main():
                         # Log the request
                         logger.info("Starting streaming response from LLM")
 
+                        # Check if LLM is initialized
+                        if st.session_state.llm is None:
+                            raise RuntimeError("LLM is not initialized. Please initialize the model in the sidebar first.")
+
                         # Stream the response (keep your existing streaming code)
                         response = ""
                         for chunk in st.session_state.llm.stream(messages):
-                            if hasattr(chunk, 'content'):
-                                response += chunk.content
+                            # Handle both string chunks and objects with content attribute
+                            if isinstance(chunk, str):
+                                response += chunk
+                            elif hasattr(chunk, 'content'):
+                                content = chunk.content
+                                if isinstance(content, str):
+                                    response += content
+                                elif isinstance(content, list):
+                                    response += ' '.join(str(item) for item in content)
+                                else:
+                                    response += str(content)
                                 # Update placeholder with current response
                                 response_placeholder.markdown(response + "▌")
 
@@ -914,6 +1132,11 @@ def main():
                             )
 
                             logger.info(f"Timetable updated with {len(new_df)} rows and {len(new_df.columns)} columns")
+                        else:
+                            # Process LLM response for database operations
+                            response = process_llm_response(response)
+                            response_placeholder.markdown(response)
+
                 except Exception as e:
                     # Keep your existing exception handling
                     error_msg = str(e)
@@ -992,7 +1215,7 @@ def display_styled_dataframe(df, title=None):
     </div>
     """
 
-    st.html(html, height=400)
+    st.html(html)
 
     # Also provide a download button
     csv = display_df.to_csv(index=False).encode('utf-8')
